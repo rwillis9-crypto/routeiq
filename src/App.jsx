@@ -949,8 +949,7 @@ Respond ONLY in JSON:
     setReoptLoading(true);
     if (apiKey) {
       try {
-        const locList = remaining.map(s => `- ID:${s.id} | ${s.name} | ${s.address}`).join("
-");
+        const locList = remaining.map(s => `- ID:${s.id} | ${s.name} | ${s.address}`).join("\n");
         const prompt = `You are a sales route optimizer. A driver has skipped a stop and needs a reoptimized route for the remaining stops.
 Current location: approximate position on the route.
 Remaining stops to visit:
@@ -1011,8 +1010,7 @@ Respond ONLY in JSON:
       s.driveMin      || "",
       `"${(s.note || "").replace(/"/g, '""')}"`,
     ]);
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("
-");
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
