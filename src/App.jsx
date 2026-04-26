@@ -1129,7 +1129,7 @@ Respond ONLY in JSON:
   const categories      = [...new Set(locs.map((l) => l.category))];
   const geocodedCount   = locs.filter((l) => l.lat && l.lng).length;
   const ungeocodedCount = locs.filter((l) => !l.lat).length;
-  const notFoundLocs    = locs.filter((l) => !l.lat && !l.lng);
+  const notFoundLocs    = locs.filter((l) => !l.lat && (l.address || l.name));
 
   const TABS = [
     { id: "map", label: "Map", icon: MapPin },
@@ -1827,7 +1827,7 @@ Respond ONLY in JSON:
                     </div>
 
                     <div className="flex gap-2 mb-4">
-                      <button onClick={() => startGeocoding()}
+                      <button onClick={() => { setDataSubTab("main"); startGeocoding(); }}
                         className="flex-1 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-bold hover:bg-amber-500/20">
                         🔄 Retry All with Name Search
                       </button>
@@ -1964,7 +1964,7 @@ Respond ONLY in JSON:
                       <div className="text-xs text-slate-400 mb-2 leading-relaxed">
                         These may have unusual addresses. The app already tried searching by facility name as a fallback. You can manually search for them on Google Maps and note their coordinates, or they simply won't appear as map pins (but are still available in the Plan tab lists).
                       </div>
-                      <button onClick={() => startGeocoding()} className="w-full px-2 py-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-semibold hover:bg-amber-500/20">
+                      <button onClick={() => startGeocoding()} className="w-full px-2 py-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-semibold hover:bg-amber-500/20 active:bg-amber-500/30">
                         🔄 Retry Not-Found Locations
                       </button>
                     </div>
