@@ -86,15 +86,54 @@ function parseKML(xmlText) {
 }
 
 // ─── Geocoding (Nominatim) ───────────────────────────────────────────────────
-async function geocodeAddress(address) {
-  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&countrycodes=us`;
+async function nominatimSearch(query) {
+  const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=1&countrycodes=us`;
   try {
     const res = await fetch(url, { headers: { "Accept-Language": "en" } });
     const data = await res.json();
     if (data && data.length > 0) {
-      return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+      return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), method: "address" };
     }
   } catch {}
+  return null;
+}
+
+// Smart geocoder — tries multiple strategies in order:
+// 1. Full address
+// 2. Name + city + state (great for hospitals, chains, well-known facilities)
+// 3. Name + state only (broader fallback)
+// 4. Name + zip if available
+async function geocodeAddress(address, name = "", city = "", state = "GA", zip = "") {
+  // Strategy 1: full address
+  if (address) {
+    const r = await nominatimSearch(address);
+    if (r) return { ...r, method: "address" };
+    await new Promise(res => setTimeout(res, 1100)); // rate limit gap
+  }
+
+  // Strategy 2: name + city + state (best for named facilities)
+  if (name && (city || state)) {
+    const q = [name, city, state].filter(Boolean).join(", ");
+    const r = await nominatimSearch(q);
+    if (r) return { ...r, method: "name+city" };
+    await new Promise(res => setTimeout(res, 1100));
+  }
+
+  // Strategy 3: name + state only
+  if (name && state) {
+    const q = `${name}, ${state}`;
+    const r = await nominatimSearch(q);
+    if (r) return { ...r, method: "name+state" };
+    await new Promise(res => setTimeout(res, 1100));
+  }
+
+  // Strategy 4: name + zip
+  if (name && zip) {
+    const q = `${name}, ${zip}`;
+    const r = await nominatimSearch(q);
+    if (r) return { ...r, method: "name+zip" };
+  }
+
   return null;
 }
 
@@ -372,6 +411,10 @@ export default function App() {
   const [dayStart, setDayStart] = useState("08:00");
   const [dayEnd, setDayEnd] = useState("17:00");
   const [scheduleResult, setScheduleResult] = useState(null); // timed schedule
+  const [skippedIds, setSkippedIds] = useState([]);          // stops skipped mid-trip
+  const [reoptLoading, setReoptLoading] = useState(false);   // reoptimizing spinner
+  const [showPrintView, setShowPrintView] = useState(false); // print modal
+  const [printTrip, setPrintTrip] = useState(null);          // trip data to print
   const [navApp, setNavApp] = useState(() => storage.get("navApp")?.value || "google");
   const [showNavPicker, setShowNavPicker] = useState(false);
   const [navPickerStop, setNavPickerStop] = useState(null); // { name, address, lat, lng }
@@ -386,6 +429,12 @@ export default function App() {
   // KML sync state
   const [syncPreview, setSyncPreview] = useState(null); // { added, removed, changed, merged }
   const [syncLoading, setSyncLoading] = useState(false);
+
+  // Manual location editor
+  const [editingLoc, setEditingLoc] = useState(null);   // location being edited
+  const [editFields, setEditFields] = useState({});      // { name, address, city, state, zip, lat, lng }
+  const [editGeocoding, setEditGeocoding] = useState(false);
+  const [dataSubTab, setDataSubTab] = useState("main"); // "main" | "notfound"
 
   const geocodeStop = useRef(false);
   const mapDiv = useRef(null);
@@ -692,36 +741,53 @@ export default function App() {
   const cancelSync = () => setSyncPreview(null);
 
   // ─── Geocoding ──
-  const startGeocoding = async () => {
+  const startGeocoding = async (retryFailed = false) => {
     geocodeStop.current = false;
-    const todo = locs.filter((l) => !l.lat && l.address);
-    if (todo.length === 0) { showToast("All locations have coordinates"); return; }
-    setGeoProgress({ active: true, done: 0, total: todo.length, found: 0 });
+
+    // retryFailed = true: retry locations that have no coords AND were previously attempted
+    // retryFailed = false (normal): process any location missing coords
+    const todo = locs.filter((l) => !l.lat && (l.address || l.name));
+
+    if (todo.length === 0) { showToast("All locations have coordinates ✓"); return; }
+    setGeoProgress({ active: true, done: 0, total: todo.length, found: 0, method: "" });
     let working = [...locs];
     let found = 0;
 
     for (let i = 0; i < todo.length; i++) {
       if (geocodeStop.current) break;
       const loc = todo[i];
-      const result = await geocodeAddress(loc.address);
+
+      // Pass all available fields to the smart geocoder
+      const result = await geocodeAddress(
+        loc.address,
+        loc.name,
+        loc.city,
+        loc.state || "GA",
+        loc.zip
+      );
+
       if (result) {
         const idx = working.findIndex((l) => l.id === loc.id);
         if (idx >= 0) {
-          working[idx] = { ...working[idx], lat: result.lat, lng: result.lng };
+          working[idx] = { ...working[idx], lat: result.lat, lng: result.lng, geocodeMethod: result.method };
           found++;
         }
       }
-      setGeoProgress({ active: true, done: i + 1, total: todo.length, found });
+
+      setGeoProgress({ active: true, done: i + 1, total: todo.length, found, method: result?.method || "" });
+
       if ((i + 1) % 20 === 0) {
         setLocs([...working]);
         persistLocs(working);
       }
-      await sleep(1100);
+      // Only wait if we didn't use fallbacks (those already have built-in delays)
+      if (result || !loc.name) await sleep(1100);
     }
     setLocs(working);
     persistLocs(working);
-    setGeoProgress({ active: false, done: todo.length, total: todo.length, found });
-    showToast(`Geocoded ${found}/${todo.length} ✓`);
+    const failed = todo.length - found;
+    setGeoProgress({ active: false, done: todo.length, total: todo.length, found, failed });
+    showToast(`Geocoded ${found}/${todo.length}${failed > 0 ? ` · ${failed} not found` : " ✓"}`);
   };
   const stopGeocoding = () => { geocodeStop.current = true; };
 
@@ -871,6 +937,92 @@ Respond ONLY in JSON:
     showToast("Trip saved ✓");
   };
 
+  // ─── Skip stop + reoptimize ──
+  const skipStop = async (stopId) => {
+    const newSkipped = [...skippedIds, stopId];
+    setSkippedIds(newSkipped);
+
+    // Get remaining stops (not yet visited, not skipped)
+    const remaining = (aiResult?.route || []).filter(s => !newSkipped.includes(s.id));
+    if (remaining.length === 0) { showToast("No stops remaining"); return; }
+
+    setReoptLoading(true);
+    if (apiKey) {
+      try {
+        const locList = remaining.map(s => `- ID:${s.id} | ${s.name} | ${s.address}`).join("
+");
+        const prompt = `You are a sales route optimizer. A driver has skipped a stop and needs a reoptimized route for the remaining stops.
+Current location: approximate position on the route.
+Remaining stops to visit:
+${locList}
+
+Reorder these remaining stops into the most efficient driving sequence.
+Respond ONLY in JSON:
+{"reasoning":"1-2 sentence explanation of reoptimized order","route":[{"id":"id","name":"name","address":"address","note":"why"}],"tips":"one tip"}`;
+        const result = await callGroqAI(apiKey, prompt);
+        setAiResult(prev => ({ ...prev, route: result.route, reasoning: result.reasoning, tips: result.tips }));
+        // Rebuild schedule
+        const locMap = Object.fromEntries(locs.map(l => [l.id, l]));
+        const sc = buildSchedule(result.route || [], locMap,
+          startCoord || { lat: 33.749, lng: -84.388 },
+          minutesToTime(timeToMinutes(dayStart) + (scheduleResult?.schedule?.length || 0) * 35),
+          mustHitTimes, mustHitDuration);
+        setScheduleResult(sc);
+        showToast("Route reoptimized ✓");
+      } catch (e) {
+        const fallback = planTripLocally(remaining.map(id => locs.find(l => l.id === id.id)).filter(Boolean), remaining.length, startCoord);
+        setAiResult(prev => ({ ...prev, route: fallback.route }));
+        showToast("Reoptimized (local) ✓");
+      }
+    } else {
+      const pool = remaining.map(s => locs.find(l => l.id === s.id)).filter(Boolean);
+      const fallback = planTripLocally(pool, pool.length, startCoord);
+      setAiResult(prev => ({ ...prev, route: fallback.route }));
+      showToast("Stop skipped, route reordered ✓");
+    }
+    setReoptLoading(false);
+  };
+
+  const undoSkip = (stopId) => {
+    setSkippedIds(prev => prev.filter(id => id !== stopId));
+    showToast("Stop restored ✓");
+  };
+
+  // ─── Print / export helpers ──
+  const openPrint = (tripData) => {
+    setPrintTrip(tripData);
+    setShowPrintView(true);
+  };
+
+  const triggerPrint = () => {
+    window.print();
+  };
+
+  const exportTripCSV = (tripData) => {
+    const route = tripData.schedule?.schedule || tripData.route || [];
+    const headers = ["Stop #", "Name", "Address", "Arrival", "Departure", "Duration (min)", "Drive From Previous (min)", "Notes"];
+    const rows = route.map((s, i) => [
+      i + 1,
+      `"${(s.name || "").replace(/"/g, '""')}"`,
+      `"${(s.address || "").replace(/"/g, '""')}"`,
+      s.arrivalTime   ? formatTime12(s.arrivalTime)   : "",
+      s.departureTime ? formatTime12(s.departureTime) : "",
+      s.duration      || 30,
+      s.driveMin      || "",
+      `"${(s.note || "").replace(/"/g, '""')}"`,
+    ]);
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("
+");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `RouteIQ-Trip-${tripData.date || todayStr()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast("CSV exported ✓");
+  };
+
   const deleteTrip = (id, e) => {
     e.stopPropagation();
     const u = history.filter((t) => t.id !== id);
@@ -886,6 +1038,60 @@ Respond ONLY in JSON:
     storage.delete("tripHistory");
     showToast("Data cleared");
     setTab("locations");
+  };
+
+  // ─── Manual location editor ──
+  const openEditor = (loc) => {
+    setEditingLoc(loc);
+    setEditFields({
+      name:    loc.name    || "",
+      address: loc.address || "",
+      city:    loc.city    || "",
+      state:   loc.state   || "GA",
+      zip:     loc.zip     || "",
+      lat:     loc.lat     ? String(loc.lat) : "",
+      lng:     loc.lng     ? String(loc.lng) : "",
+    });
+  };
+
+  const closeEditor = () => { setEditingLoc(null); setEditFields({}); setEditGeocoding(false); };
+
+  const saveEditedLoc = () => {
+    if (!editingLoc) return;
+    const lat = parseFloat(editFields.lat);
+    const lng = parseFloat(editFields.lng);
+    const updated = locs.map(l => l.id === editingLoc.id ? {
+      ...l,
+      name:    editFields.name.trim()    || l.name,
+      address: editFields.address.trim() || l.address,
+      city:    editFields.city.trim()    || l.city,
+      state:   editFields.state.trim()   || l.state,
+      zip:     editFields.zip.trim()     || l.zip,
+      lat:     !isNaN(lat) && lat ? lat : l.lat,
+      lng:     !isNaN(lng) && lng ? lng : l.lng,
+    } : l);
+    setLocs(updated);
+    persistLocs(updated);
+    showToast("Location updated ✓");
+    closeEditor();
+  };
+
+  const geocodeEditedLoc = async () => {
+    setEditGeocoding(true);
+    const result = await geocodeAddress(
+      editFields.address,
+      editFields.name,
+      editFields.city,
+      editFields.state || "GA",
+      editFields.zip
+    );
+    if (result) {
+      setEditFields(prev => ({ ...prev, lat: String(result.lat), lng: String(result.lng) }));
+      showToast(`Found via ${result.method} ✓`);
+    } else {
+      showToast("Still not found — try editing the address or name", "warn");
+    }
+    setEditGeocoding(false);
   };
 
   // ─── Export / import data ──
@@ -922,9 +1128,10 @@ Respond ONLY in JSON:
   };
 
   // ─── Derived ──
-  const categories = [...new Set(locs.map((l) => l.category))];
-  const geocodedCount = locs.filter((l) => l.lat && l.lng).length;
-  const ungeocodedCount = locs.filter((l) => !l.lat && l.address).length;
+  const categories      = [...new Set(locs.map((l) => l.category))];
+  const geocodedCount   = locs.filter((l) => l.lat && l.lng).length;
+  const ungeocodedCount = locs.filter((l) => !l.lat).length;
+  const notFoundLocs    = locs.filter((l) => !l.lat && !l.lng);
 
   const TABS = [
     { id: "map", label: "Map", icon: MapPin },
@@ -1008,7 +1215,10 @@ Respond ONLY in JSON:
             {geoProgress.active && (
               <div className="absolute top-16 right-4 z-[999] bg-slate-900/95 border border-amber-500 rounded-lg p-3 backdrop-blur min-w-[200px]">
                 <div className="text-xs font-bold text-amber-500 mb-1 flex items-center gap-1.5"><MapPin size={12} />Geocoding…</div>
-                <div className="text-xs text-slate-400">{geoProgress.done} / {geoProgress.total} · {geoProgress.found} found</div>
+                <div className="text-xs text-slate-400">
+                  {geoProgress.done} / {geoProgress.total} · <span className="text-emerald-400">{geoProgress.found} found</span>
+                  {geoProgress.method && geoProgress.method !== "address" && <span className="text-amber-400 ml-1">✨ name match</span>}
+                </div>
                 <div className="h-1.5 bg-slate-700 rounded mt-2 overflow-hidden">
                   <div className="h-full bg-gradient-to-r from-amber-500 to-orange-600 transition-all" style={{ width: `${(geoProgress.done / geoProgress.total) * 100}%` }} />
                 </div>
@@ -1062,6 +1272,12 @@ Respond ONLY in JSON:
                         <span className="inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase" style={{ background: col + "20", color: col }}>{loc.category}</span>
                       </div>
                     </div>
+                    <button
+                      onClick={e => { e.stopPropagation(); openEditor(loc); }}
+                      className="flex-shrink-0 self-center p-1.5 rounded text-slate-600 hover:text-amber-400 hover:bg-slate-700 transition-colors"
+                      title="Edit location">
+                      ✏️
+                    </button>
                   </div>
                 );
               })}
@@ -1316,11 +1532,29 @@ Respond ONLY in JSON:
                           )}
                         </div>
 
+                        {/* Skipped stops restore bar */}
+                        {skippedIds.length > 0 && (
+                          <div className="mb-2 p-2 bg-slate-700/50 rounded-lg flex items-center justify-between">
+                            <span className="text-xs text-slate-400">{skippedIds.length} stop{skippedIds.length > 1 ? "s" : ""} skipped</span>
+                            <button onClick={() => setSkippedIds([])} className="text-xs text-amber-400 hover:text-amber-300">↩ Restore All</button>
+                          </div>
+                        )}
+                        {reoptLoading && (
+                          <div className="mb-2 p-2 bg-blue-500/10 border border-blue-500/20 rounded-lg flex items-center gap-2 text-xs text-blue-400">
+                            <div className="w-3 h-3 border-2 border-blue-400/30 border-t-blue-400 rounded-full animate-spin" />
+                            Reoptimizing route…
+                          </div>
+                        )}
                         <ul className="space-y-1.5">
-                          {scheduleResult.schedule.map((s, i) => (
-                            <li key={i} className={`rounded-lg border text-xs overflow-hidden ${s.isPinned ? "border-amber-500/40 bg-amber-500/5" : "border-slate-700 bg-slate-900/50"}`}>
+                          {scheduleResult.schedule.map((s, i) => {
+                            const isSkipped = skippedIds.includes(s.id);
+                            return (
+                            <li key={i} className={`rounded-lg border text-xs overflow-hidden transition-all ${
+                              isSkipped ? "opacity-40 border-slate-700 bg-slate-900/30" :
+                              s.isPinned ? "border-amber-500/40 bg-amber-500/5" : "border-slate-700 bg-slate-900/50"
+                            }`}>
                               {/* Drive time row */}
-                              {s.driveMin > 0 && (
+                              {s.driveMin > 0 && !isSkipped && (
                                 <div className="flex items-center gap-2 px-3 py-1 border-b border-slate-700/50">
                                   <span className="text-slate-500">🚗</span>
                                   <span className="text-slate-500">~{s.driveMin} min drive</span>
@@ -1328,47 +1562,64 @@ Respond ONLY in JSON:
                               )}
                               {/* Stop row */}
                               <div className="flex items-start gap-2 p-2.5">
-                                <div className={`w-6 h-6 rounded-full font-bold text-xs flex items-center justify-center flex-shrink-0 mt-0.5 ${s.isPinned ? "bg-amber-500 text-black" : "bg-slate-700 text-slate-200"}`}>
-                                  {i + 1}
+                                <div className={`w-6 h-6 rounded-full font-bold text-xs flex items-center justify-center flex-shrink-0 mt-0.5 ${
+                                  isSkipped ? "bg-slate-700 text-slate-500" :
+                                  s.isPinned ? "bg-amber-500 text-black" : "bg-slate-700 text-slate-200"
+                                }`}>
+                                  {isSkipped ? "✕" : i + 1 - skippedIds.filter((id, si) => scheduleResult.schedule.findIndex(x => x.id === id) < i).length}
                                 </div>
                                 <div className="flex-1 min-w-0">
                                   <div className="flex items-center gap-1.5 flex-wrap">
-                                    <span className="font-semibold">{s.name}</span>
-                                    {s.isPinned && <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-400 font-bold">📅 APPT</span>}
+                                    <span className={`font-semibold ${isSkipped ? "line-through text-slate-500" : ""}`}>{s.name}</span>
+                                    {s.isPinned && !isSkipped && <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-400 font-bold">📅 APPT</span>}
+                                    {isSkipped && <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-700 text-slate-400">SKIPPED</span>}
                                   </div>
-                                  <div className="text-slate-500 truncate mt-0.5">{s.address}</div>
-                                  <div className="flex items-center gap-2 mt-1 flex-wrap">
-                                    <span className="text-emerald-400 font-semibold">{formatTime12(s.arrivalTime)}</span>
-                                    <span className="text-slate-500">→</span>
-                                    <span className="text-slate-400">{formatTime12(s.departureTime)}</span>
-                                    <span className="text-slate-600">({s.duration} min)</span>
-                                    {s.warning && <span className="text-red-400 font-semibold">{s.warning}</span>}
-                                  </div>
-                                  {s.isPinned && s.pinnedTime && (
-                                    <div className="text-amber-500 text-[10px] mt-0.5">
-                                      Fixed appointment: {formatTime12(s.pinnedTime)}
-                                    </div>
+                                  {!isSkipped && (
+                                    <>
+                                      <div className="text-slate-500 truncate mt-0.5">{s.address}</div>
+                                      <div className="flex items-center gap-2 mt-1 flex-wrap">
+                                        <span className="text-emerald-400 font-semibold">{formatTime12(s.arrivalTime)}</span>
+                                        <span className="text-slate-500">→</span>
+                                        <span className="text-slate-400">{formatTime12(s.departureTime)}</span>
+                                        <span className="text-slate-600">({s.duration} min)</span>
+                                        {s.warning && <span className="text-red-400 font-semibold">{s.warning}</span>}
+                                      </div>
+                                      {s.isPinned && s.pinnedTime && (
+                                        <div className="text-amber-500 text-[10px] mt-0.5">Fixed appointment: {formatTime12(s.pinnedTime)}</div>
+                                      )}
+                                    </>
                                   )}
                                 </div>
-                                {/* Navigate button */}
-                                <button
-                                  onClick={() => {
-                                    const loc = locs.find(l => l.id === s.id);
-                                    openNavPicker({ name: s.name, address: s.address, lat: loc?.lat, lng: loc?.lng });
-                                  }}
-                                  className="flex-shrink-0 self-center px-2.5 py-1.5 rounded-lg bg-blue-500/15 border border-blue-500/30 text-blue-400 text-[11px] font-semibold hover:bg-blue-500/25 transition-colors flex items-center gap-1">
-                                  {NAV_APPS.find(a => a.id === navApp)?.icon} Go
-                                </button>
+                                {isSkipped ? (
+                                  <button onClick={() => undoSkip(s.id)}
+                                    className="flex-shrink-0 self-center px-2 py-1 rounded bg-slate-700 text-slate-400 text-[11px] font-semibold hover:bg-slate-600">
+                                    ↩
+                                  </button>
+                                ) : (
+                                  <div className="flex flex-col gap-1 flex-shrink-0 self-center">
+                                    <button
+                                      onClick={() => { const loc = locs.find(l => l.id === s.id); openNavPicker({ name: s.name, address: s.address, lat: loc?.lat, lng: loc?.lng }); }}
+                                      className="px-2 py-1 rounded bg-blue-500/15 border border-blue-500/30 text-blue-400 text-[11px] font-semibold hover:bg-blue-500/25 flex items-center gap-1">
+                                      {NAV_APPS.find(a => a.id === navApp)?.icon} Go
+                                    </button>
+                                    {!s.isPinned && (
+                                      <button onClick={() => skipStop(s.id)}
+                                        className="px-2 py-1 rounded bg-red-500/10 border border-red-500/20 text-red-400 text-[11px] font-semibold hover:bg-red-500/20">
+                                        Skip
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </li>
-                          ))}
+                          );})}
                         </ul>
                         {/* Full route button */}
                         <button
                           onClick={() => {
-                            const first = scheduleResult.schedule[0];
-                            const loc = locs.find(l => l.id === first.id);
-                            navigateTo({ name: first.name, address: first.address, lat: loc?.lat, lng: loc?.lng }, true);
+                            const first = scheduleResult.schedule.find(s => !skippedIds.includes(s.id));
+                            const loc = locs.find(l => l.id === first?.id);
+                            navigateTo({ name: first?.name, address: first?.address, lat: loc?.lat, lng: loc?.lng }, true);
                           }}
                           className="w-full mt-2 py-2.5 rounded-lg bg-blue-500 text-white text-xs font-bold flex items-center justify-center gap-2 hover:bg-blue-600 transition-colors">
                           {NAV_APPS.find(a => a.id === navApp)?.icon} Open Full Route in {NAV_APPS.find(a => a.id === navApp)?.label}
@@ -1403,6 +1654,10 @@ Respond ONLY in JSON:
                     <div className="flex gap-2 mt-3">
                       <button onClick={saveTrip} className="flex-1 bg-slate-900 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5"><Save size={13} />Save</button>
                       <button onClick={() => flyToRoute(aiResult.route)} className="flex-1 bg-slate-900 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5"><MapPin size={13} />Map</button>
+                      <button onClick={() => openPrint({ date: tripDate, startLoc, route: aiResult.route, reasoning: aiResult.reasoning, tips: aiResult.tips, schedule: scheduleResult })}
+                        className="flex-1 bg-slate-900 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5">🖨️ Print</button>
+                      <button onClick={() => exportTripCSV({ date: tripDate, startLoc, route: aiResult.route, schedule: scheduleResult })}
+                        className="flex-1 bg-slate-900 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5">📊 CSV</button>
                     </div>
                   </div>
                 )}
@@ -1506,19 +1761,21 @@ Respond ONLY in JSON:
                   })}
                 </ul>
                 {selTrip.tips && <div className="mt-3 px-3 py-2 bg-amber-500/10 rounded text-xs text-amber-400">💡 {selTrip.tips}</div>}
-                <div className="flex gap-2 mt-3">
+                <div className="grid grid-cols-2 gap-2 mt-3">
                   <button
                     onClick={() => {
                       const first = selTrip.route?.[0];
                       const loc = locs.find(l => l.id === first?.id);
                       navigateTo({ name: first?.name, address: first?.address, lat: loc?.lat, lng: loc?.lng }, true);
                     }}
-                    className="flex-1 bg-blue-500/15 border border-blue-500/30 text-blue-400 hover:bg-blue-500/25 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5">
+                    className="bg-blue-500/15 border border-blue-500/30 text-blue-400 hover:bg-blue-500/25 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5">
                     {NAV_APPS.find(a => a.id === navApp)?.icon} Navigate
                   </button>
-                  <button onClick={() => flyToRoute(selTrip.route)} className="flex-1 bg-slate-800 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5"><MapPin size={13} />Map</button>
+                  <button onClick={() => flyToRoute(selTrip.route)} className="bg-slate-800 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5"><MapPin size={13} />Map</button>
+                  <button onClick={() => openPrint(selTrip)} className="bg-slate-800 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5">🖨️ Print</button>
+                  <button onClick={() => exportTripCSV(selTrip)} className="bg-slate-800 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold flex items-center justify-center gap-1.5">📊 CSV</button>
                   <button onClick={() => { setTripDate(selTrip.date); setStartLoc(selTrip.startLoc); setNotes(selTrip.notes || ""); setNumStops(selTrip.numStops || "5"); setTab("plan"); }}
-                    className="flex-1 bg-slate-800 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold">↩ Re-plan</button>
+                    className="col-span-2 bg-slate-800 border border-slate-700 hover:border-amber-500 hover:text-amber-500 rounded py-2 text-xs font-semibold text-center">↩ Re-plan</button>
                 </div>
               </>
             )}
@@ -1528,7 +1785,85 @@ Respond ONLY in JSON:
 
       {/* DATA / SETTINGS */}
       {tab === "locations" && (
-        <div className="flex-1 overflow-y-auto p-5">
+        <div className="flex-1 overflow-y-auto">
+          {/* Sub-tab bar */}
+          <div className="flex border-b border-slate-800 bg-slate-900 px-5">
+            <button onClick={() => setDataSubTab("main")}
+              className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors ${dataSubTab === "main" ? "text-amber-500 border-amber-500" : "text-slate-400 border-transparent hover:text-slate-200"}`}>
+              ⚙️ Setup & Data
+            </button>
+            <button onClick={() => setDataSubTab("notfound")}
+              className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors flex items-center gap-1.5 ${dataSubTab === "notfound" ? "text-red-400 border-red-400" : "text-slate-400 border-transparent hover:text-slate-200"}`}>
+              ⚠️ Not Found
+              {notFoundLocs.length > 0 && (
+                <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-red-500/20 text-red-400">{notFoundLocs.length}</span>
+              )}
+            </button>
+          </div>
+
+          {/* NOT FOUND sub-tab */}
+          {dataSubTab === "notfound" && (
+            <div className="p-5">
+              <div className="max-w-3xl mx-auto">
+                {notFoundLocs.length === 0 ? (
+                  <div className="text-center py-12 text-slate-500">
+                    <div className="text-4xl mb-3">✅</div>
+                    <div className="font-semibold text-emerald-400">All locations geocoded!</div>
+                    <div className="text-xs mt-2">Every location has coordinates and will appear on the map.</div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="bg-slate-800 border border-slate-700 rounded-lg p-4 mb-4">
+                      <div className="font-bold text-sm mb-1">⚠️ {notFoundLocs.length} locations couldn't be geocoded</div>
+                      <div className="text-xs text-slate-400 leading-relaxed mb-3">
+                        These locations have no map coordinates. Click <strong className="text-slate-200">Edit</strong> on any one to fix the address or name, then try geocoding again. Or paste coordinates directly from Google Maps.
+                      </div>
+                      <div className="bg-slate-900 rounded p-3 text-xs text-slate-400 leading-relaxed">
+                        <strong className="text-slate-200">How to get coordinates from Google Maps:</strong><br />
+                        1. Go to maps.google.com and search for the facility<br />
+                        2. Click on the location pin<br />
+                        3. Right-click the pin → the coordinates appear at the top of the menu<br />
+                        4. Click them to copy (looks like: 33.7490, -84.3880)<br />
+                        5. Paste into the Latitude and Longitude fields in the Edit screen
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 mb-4">
+                      <button onClick={() => startGeocoding()}
+                        className="flex-1 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-bold hover:bg-amber-500/20">
+                        🔄 Retry All with Name Search
+                      </button>
+                    </div>
+
+                    <div className="space-y-2">
+                      {notFoundLocs.map((loc) => {
+                        const col = categoryColors[loc.category] || "#888";
+                        return (
+                          <div key={loc.id} className="bg-slate-800 border border-slate-700 rounded-lg p-3 flex items-start gap-3">
+                            <div className="flex-1 min-w-0">
+                              <div className="font-semibold text-sm truncate">{loc.name}</div>
+                              <div className="text-xs text-slate-500 mt-0.5 truncate">{loc.address || "No address"}</div>
+                              <div className="flex gap-2 mt-1.5 flex-wrap">
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: col + "20", color: col }}>{loc.category}</span>
+                                {loc.city && <span className="text-[10px] text-slate-500">{loc.city}, {loc.state}</span>}
+                              </div>
+                            </div>
+                            <button onClick={() => openEditor(loc)}
+                              className="flex-shrink-0 px-3 py-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-semibold hover:bg-amber-500/20">
+                              ✏️ Edit
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {dataSubTab === "main" && (
+          <div className="p-5">
           <div className="max-w-3xl mx-auto space-y-3">
             <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
               <div className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3 flex items-center gap-1.5">
@@ -1594,20 +1929,45 @@ Respond ONLY in JSON:
                   </div>
 
                   {ungeocodedCount > 0 && !geoProgress.active && (
-                    <button onClick={startGeocoding} className="w-full mt-3.5 bg-gradient-to-br from-amber-500 to-orange-600 text-black rounded py-2.5 font-bold text-sm">
-                      📍 Geocode {ungeocodedCount} Addresses (~{Math.ceil(ungeocodedCount / 60)} min)
+                    <button onClick={() => startGeocoding()} className="w-full mt-3.5 bg-gradient-to-br from-amber-500 to-orange-600 text-black rounded py-2.5 font-bold text-sm">
+                      📍 Geocode {ungeocodedCount} Locations (~{Math.ceil(ungeocodedCount / 45)} min)
                     </button>
                   )}
 
                   {geoProgress.active && (
                     <div className="mt-3.5 p-3 bg-slate-900 rounded">
                       <div className="text-xs font-bold text-amber-500 mb-1 flex items-center gap-1.5"><MapPin size={12} />Geocoding in progress…</div>
-                      <div className="text-xs text-slate-400">{geoProgress.done} / {geoProgress.total} · {geoProgress.found} found</div>
-                      <div className="h-1.5 bg-slate-700 rounded mt-2 overflow-hidden">
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="text-xs text-slate-400">{geoProgress.done} / {geoProgress.total} · <span className="text-emerald-400">{geoProgress.found} found</span></div>
+                        {geoProgress.method && (
+                          <div className="text-[10px] text-slate-500 italic">
+                            {geoProgress.method === "address" && "via address"}
+                            {geoProgress.method === "name+city" && "✨ via name"}
+                            {geoProgress.method === "name+state" && "✨ via name"}
+                            {geoProgress.method === "name+zip" && "✨ via name+zip"}
+                          </div>
+                        )}
+                      </div>
+                      <div className="h-1.5 bg-slate-700 rounded overflow-hidden">
                         <div className="h-full bg-gradient-to-r from-amber-500 to-orange-600 transition-all" style={{ width: `${(geoProgress.done / geoProgress.total) * 100}%` }} />
                       </div>
                       <button onClick={stopGeocoding} className="w-full mt-2 px-2 py-1.5 bg-slate-800 hover:border-red-500 text-red-400 border border-slate-700 rounded text-xs font-semibold flex items-center justify-center gap-1.5">
                         <Pause size={11} />Pause
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Show not-found count after geocoding finishes with a retry option */}
+                  {!geoProgress.active && geoProgress.failed > 0 && (
+                    <div className="mt-2 p-3 bg-red-500/5 border border-red-500/20 rounded">
+                      <div className="text-xs font-bold text-red-400 mb-1">
+                        ⚠️ {geoProgress.failed} locations not found
+                      </div>
+                      <div className="text-xs text-slate-400 mb-2 leading-relaxed">
+                        These may have unusual addresses. The app already tried searching by facility name as a fallback. You can manually search for them on Google Maps and note their coordinates, or they simply won't appear as map pins (but are still available in the Plan tab lists).
+                      </div>
+                      <button onClick={() => startGeocoding()} className="w-full px-2 py-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-semibold hover:bg-amber-500/20">
+                        🔄 Retry Not-Found Locations
                       </button>
                     </div>
                   )}
@@ -1645,6 +2005,187 @@ Respond ONLY in JSON:
                 </div>
               </>
             )}
+          </div>
+          </div>
+          )}
+        </div>
+      )}
+
+      {/* PRINT VIEW MODAL */}
+      {showPrintView && printTrip && (
+        <div className="fixed inset-0 z-[9995] bg-black/80 flex items-center justify-center p-4 print:p-0 print:bg-white print:inset-auto">
+          <div className="bg-white text-gray-900 rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl print:shadow-none print:max-h-none print:rounded-none print:max-w-none">
+            {/* Print toolbar — hidden when printing */}
+            <div className="flex items-center justify-between px-5 py-3 bg-slate-800 rounded-t-xl print:hidden">
+              <span className="text-white font-bold text-sm">🖨️ Print Preview</span>
+              <div className="flex gap-2">
+                <button onClick={triggerPrint} className="px-4 py-1.5 bg-amber-500 text-black rounded font-bold text-xs">Print / Save PDF</button>
+                <button onClick={() => setShowPrintView(false)} className="px-3 py-1.5 bg-slate-700 text-white rounded text-xs">Close</button>
+              </div>
+            </div>
+
+            {/* Printable content */}
+            <div className="p-8">
+              {/* Header */}
+              <div className="border-b-2 border-gray-900 pb-4 mb-6">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h1 className="text-2xl font-bold text-gray-900">RouteIQ Trip Plan</h1>
+                    <div className="text-lg text-gray-600 mt-1">{fmtDate(printTrip.date)}</div>
+                  </div>
+                  <div className="text-right text-sm text-gray-500">
+                    <div>Starting from:</div>
+                    <div className="font-semibold text-gray-800">{printTrip.startLoc}</div>
+                    {printTrip.schedule?.totalDriveMin > 0 && (
+                      <div className="mt-1">~{Math.round(printTrip.schedule.totalDriveMin / 60)}h {printTrip.schedule.totalDriveMin % 60}m driving</div>
+                    )}
+                  </div>
+                </div>
+                {printTrip.reasoning && (
+                  <div className="mt-3 text-sm text-gray-600 italic border-l-4 border-gray-300 pl-3">{printTrip.reasoning}</div>
+                )}
+              </div>
+
+              {/* Route stops */}
+              <div className="space-y-3">
+                {(printTrip.schedule?.schedule || printTrip.route || []).map((s, i) => (
+                  <div key={i} className="flex gap-4 p-3 border border-gray-200 rounded-lg">
+                    <div className="w-8 h-8 rounded-full bg-gray-900 text-white font-bold text-sm flex items-center justify-center flex-shrink-0 mt-0.5">
+                      {i + 1}
+                    </div>
+                    <div className="flex-1">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
+                        <div className="font-bold text-gray-900">{s.name}</div>
+                        {(s.arrivalTime || s.pinnedTime) && (
+                          <div className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+                            {s.driveMin > 0 && <span className="text-gray-400 font-normal text-xs">🚗 {s.driveMin}min drive</span>}
+                            {s.arrivalTime && <span className="text-green-700">{formatTime12(s.arrivalTime)}</span>}
+                            {s.arrivalTime && s.departureTime && <span className="text-gray-400">→</span>}
+                            {s.departureTime && <span className="text-gray-600">{formatTime12(s.departureTime)}</span>}
+                            {s.isPinned && <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded text-xs font-bold">📅 APPT</span>}
+                          </div>
+                        )}
+                      </div>
+                      <div className="text-sm text-gray-500 mt-0.5">{s.address}</div>
+                      {s.note && <div className="text-xs text-gray-400 italic mt-1">{s.note}</div>}
+                      {/* Notes line for handwriting */}
+                      <div className="mt-2 border-b border-dotted border-gray-300 h-5"></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Tips */}
+              {printTrip.tips && (
+                <div className="mt-6 p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+                  💡 {printTrip.tips}
+                </div>
+              )}
+
+              {/* Notes section */}
+              <div className="mt-6">
+                <div className="font-bold text-gray-700 mb-2 text-sm uppercase tracking-wide">Notes</div>
+                <div className="space-y-2">
+                  {[1,2,3].map(n => <div key={n} className="border-b border-dotted border-gray-300 h-7"></div>)}
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="mt-6 pt-3 border-t border-gray-200 text-xs text-gray-400 flex justify-between">
+                <span>Generated by RouteIQ · rwillis9-crypto.github.io/routeiq/</span>
+                <span>Printed {new Date().toLocaleDateString()}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LOCATION EDITOR MODAL */}
+      {editingLoc && (
+        <div className="fixed inset-0 z-[9996] bg-black/70 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-md shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+              <div>
+                <h2 className="font-bold text-sm">✏️ Edit Location</h2>
+                <div className="text-xs text-slate-400 mt-0.5 truncate max-w-[280px]">{editingLoc.name}</div>
+              </div>
+              <button onClick={closeEditor} className="text-slate-400 hover:text-slate-200"><X size={18} /></button>
+            </div>
+
+            <div className="p-4 space-y-3 overflow-y-auto max-h-[65vh]">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Facility Name</label>
+                <input value={editFields.name} onChange={e => setEditFields(p => ({...p, name: e.target.value}))}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-amber-500 outline-none" />
+              </div>
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Street Address</label>
+                <input value={editFields.address} onChange={e => setEditFields(p => ({...p, address: e.target.value}))}
+                  placeholder="123 Main St, City, GA 12345"
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-amber-500 outline-none" />
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">City</label>
+                  <input value={editFields.city} onChange={e => setEditFields(p => ({...p, city: e.target.value}))}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">State</label>
+                  <input value={editFields.state} onChange={e => setEditFields(p => ({...p, state: e.target.value}))}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Zip</label>
+                  <input value={editFields.zip} onChange={e => setEditFields(p => ({...p, zip: e.target.value}))}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+              </div>
+
+              {/* Geocode attempt button */}
+              <button onClick={geocodeEditedLoc} disabled={editGeocoding}
+                className="w-full py-2 bg-blue-500/15 border border-blue-500/30 text-blue-400 rounded text-xs font-semibold hover:bg-blue-500/25 disabled:opacity-50 flex items-center justify-center gap-2">
+                {editGeocoding
+                  ? <><div className="w-3 h-3 border-2 border-blue-400/30 border-t-blue-400 rounded-full animate-spin" />Searching…</>
+                  : "🔍 Try to Geocode with Updated Info"}
+              </button>
+
+              {/* Manual coordinates section */}
+              <div className="border-t border-slate-700 pt-3">
+                <div className="text-xs font-bold text-slate-400 mb-1">📍 Manual Coordinates</div>
+                <div className="text-xs text-slate-500 mb-2 leading-relaxed">
+                  Can't geocode automatically? Look up the location on <span className="text-blue-400">Google Maps</span>, right-click the pin, and copy the coordinates. Paste them here.
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Latitude</label>
+                    <input value={editFields.lat} onChange={e => setEditFields(p => ({...p, lat: e.target.value}))}
+                      placeholder="e.g. 33.7490"
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm font-mono focus:border-amber-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Longitude</label>
+                    <input value={editFields.lng} onChange={e => setEditFields(p => ({...p, lng: e.target.value}))}
+                      placeholder="e.g. -84.3880"
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm font-mono focus:border-amber-500 outline-none" />
+                  </div>
+                </div>
+                {editFields.lat && editFields.lng && (
+                  <div className="mt-2 text-xs text-emerald-400 flex items-center gap-1.5">
+                    <Check size={12} />Coordinates ready — click Save to apply
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-4 py-3 border-t border-slate-800 flex gap-3">
+              <button onClick={closeEditor} className="flex-1 bg-slate-800 border border-slate-700 rounded py-2.5 text-sm font-semibold text-slate-300">
+                Cancel
+              </button>
+              <button onClick={saveEditedLoc} className="flex-2 flex-1 bg-gradient-to-br from-amber-500 to-orange-600 text-black rounded py-2.5 text-sm font-bold">
+                💾 Save Changes
+              </button>
+            </div>
           </div>
         </div>
       )}
