@@ -11,10 +11,11 @@
     "deploy": "npm run build && npx gh-pages -d dist"
   },
   "dependencies": {
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.460.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "leaflet": "^1.9.4",
-    "lucide-react": "^0.460.0"
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.3",
