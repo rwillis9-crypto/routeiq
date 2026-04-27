@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import L from "leaflet";
+import * as XLSX from "xlsx";
 import {
   MapPin, Calendar, Sparkles, Save, History, Upload, Trash2,
   X, Check, Navigation, AlertCircle, Key, Settings, Pause, Play
@@ -431,7 +432,10 @@ export default function App() {
   const [syncLoading, setSyncLoading] = useState(false);
 
   // Manual location editor
-  const [editingLoc, setEditingLoc] = useState(null);   // location being edited
+  const [editingLoc, setEditingLoc] = useState(null);
+  const [showAddLocation, setShowAddLocation] = useState(false);
+  const [addFields, setAddFields] = useState({ name:"", address:"", city:"", state:"GA", zip:"", category:"", lat:"", lng:"" });
+  const [addGeocoding, setAddGeocoding] = useState(false);   // location being edited
   const [editFields, setEditFields] = useState({});      // { name, address, city, state, zip, lat, lng }
   const [editGeocoding, setEditGeocoding] = useState(false);
   const [dataSubTab, setDataSubTab] = useState("main"); // "main" | "notfound"
@@ -1021,6 +1025,124 @@ Respond ONLY in JSON:
     showToast("CSV exported ✓");
   };
 
+  // ─── Excel export of not-found locations ──
+  const exportNotFoundXLSX = () => {
+    const rows = notFoundLocs.map((l, i) => ({
+      "Row #":      i + 1,
+      "ID":         l.id,
+      "Name":       l.name       || "",
+      "Street":     l.street     || l.address || "",
+      "City":       l.city       || "",
+      "State":      l.state      || "",
+      "Zip":        l.zip        || "",
+      "Full Address": l.address  || "",
+      "Category":   l.category   || "",
+      "Latitude":   "",   // ← fill these in your external script
+      "Longitude":  "",
+      "Notes":      "",
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+
+    // Column widths
+    ws["!cols"] = [
+      { wch: 6 }, { wch: 20 }, { wch: 35 }, { wch: 30 },
+      { wch: 18 }, { wch: 8 }, { wch: 10 }, { wch: 40 },
+      { wch: 22 }, { wch: 12 }, { wch: 12 }, { wch: 20 },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Not Found Locations");
+
+    // Add instructions sheet
+    const instructions = [
+      ["INSTRUCTIONS — RouteIQ Location Geocoding"],
+      [""],
+      ["1. The 'Latitude' and 'Longitude' columns are empty — fill them in using your geocoding script or manually from Google Maps"],
+      ["2. Do NOT change the 'ID' column — RouteIQ uses it to match rows back to your locations"],
+      ["3. Do NOT add or remove rows"],
+      ["4. Latitude example:  33.7490"],
+      ["5. Longitude example: -84.3880  (negative for USA)"],
+      ["6. Save the file as .xlsx and upload it back into RouteIQ using the 'Import Geocoded Excel' button"],
+      [""],
+      ["How to get coordinates from Google Maps:"],
+      ["  - Search for the facility name"],
+      ["  - Right-click the pin on the map"],
+      ["  - The coordinates appear at the top of the right-click menu"],
+      ["  - Click them to copy (format: 33.7490, -84.3880)"],
+    ];
+    const ws2 = XLSX.utils.aoa_to_sheet(instructions);
+    ws2["!cols"] = [{ wch: 80 }];
+    XLSX.utils.book_append_sheet(wb, ws2, "Instructions");
+
+    XLSX.writeFile(wb, `RouteIQ-NotFound-${todayStr()}.xlsx`);
+    showToast(`Exported ${rows.length} locations to Excel ✓`);
+  };
+
+  // ─── Import geocoded Excel back in ──
+  const importGeocodedXLSX = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const buffer = await file.arrayBuffer();
+      const wb     = XLSX.read(buffer, { type: "array" });
+
+      // Read first sheet
+      const ws   = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws);
+
+      if (rows.length === 0) { showToast("No data found in Excel file", "err"); return; }
+
+      // Validate it has the right columns
+      const first = rows[0];
+      if (!("ID" in first) || !("Latitude" in first) || !("Longitude" in first)) {
+        showToast("Excel file must have ID, Latitude, and Longitude columns", "err");
+        return;
+      }
+
+      // Build a map of id → coords from the Excel rows
+      const coordMap = {};
+      let filled = 0;
+      for (const row of rows) {
+        const id  = String(row["ID"] || "").trim();
+        const lat = parseFloat(row["Latitude"]  || row["latitude"]  || "");
+        const lng = parseFloat(row["Longitude"] || row["longitude"] || "");
+        if (id && !isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
+          coordMap[id] = { lat, lng };
+          filled++;
+        }
+      }
+
+      if (filled === 0) {
+        showToast("No coordinates found in the Excel file — make sure Latitude and Longitude columns are filled in", "warn");
+        return;
+      }
+
+      // Apply to locations
+      const updated = locs.map(l => {
+        if (coordMap[l.id]) {
+          return { ...l, lat: coordMap[l.id].lat, lng: coordMap[l.id].lng, geocodeMethod: "excel-import" };
+        }
+        return l;
+      });
+
+      setLocs(updated);
+      persistLocs(updated);
+      showToast(`Imported ${filled} coordinates from Excel ✓`);
+
+      // Refresh map markers
+      if (leafletMap.current) {
+        Object.values(markers.current).forEach(m => leafletMap.current.removeLayer(m));
+        markers.current = {};
+        updated.filter(l => l.lat && l.lng).forEach(loc => placeMarker(window.L, leafletMap.current, loc));
+      }
+    } catch (err) {
+      showToast("Error reading Excel file: " + err.message, "err");
+    }
+    // Reset input so same file can be re-imported
+    e.target.value = "";
+  };
+
   const deleteTrip = (id, e) => {
     e.stopPropagation();
     const u = history.filter((t) => t.id !== id);
@@ -1053,6 +1175,59 @@ Respond ONLY in JSON:
   };
 
   const closeEditor = () => { setEditingLoc(null); setEditFields({}); setEditGeocoding(false); };
+
+  const openAddLocation = () => {
+    setAddFields({ name:"", address:"", city:"", state:"GA", zip:"", category: categories[0] || "", lat:"", lng:"" });
+    setShowAddLocation(true);
+  };
+
+  const geocodeAddFields = async () => {
+    setAddGeocoding(true);
+    const fullAddr = [addFields.address, addFields.city, addFields.state, addFields.zip].filter(Boolean).join(", ");
+    const result = await geocodeAddress(fullAddr, addFields.name, addFields.city, addFields.state || "GA", addFields.zip);
+    if (result) {
+      setAddFields(prev => ({ ...prev, lat: String(result.lat), lng: String(result.lng) }));
+      showToast(`Found via ${result.method} ✓`);
+    } else {
+      showToast("Address not found — try editing or enter coordinates manually", "warn");
+    }
+    setAddGeocoding(false);
+  };
+
+  const saveNewLocation = () => {
+    if (!addFields.name.trim()) { showToast("Name is required", "err"); return; }
+
+    const lat = parseFloat(addFields.lat);
+    const lng = parseFloat(addFields.lng);
+    const newLoc = {
+      id:       "manual_" + Date.now(),
+      name:     addFields.name.trim(),
+      address:  [addFields.address, addFields.city, addFields.state, addFields.zip].filter(Boolean).join(", "),
+      street:   addFields.address,
+      city:     addFields.city,
+      state:    addFields.state || "GA",
+      zip:      addFields.zip,
+      category: addFields.category || "Manual Entry",
+      lat:      !isNaN(lat) && lat ? lat : null,
+      lng:      !isNaN(lng) && lng ? lng : null,
+      geocodeMethod: "manual",
+    };
+
+    const updated = [...locs, newLoc];
+
+    // If category is new, assign a color
+    if (!categoryColors[newLoc.category]) {
+      const newColors = { ...categoryColors };
+      newColors[newLoc.category] = CATEGORY_COLORS[Object.keys(newColors).length % CATEGORY_COLORS.length];
+      setCategoryColors(newColors);
+    }
+
+    setLocs(updated);
+    persistLocs(updated);
+    setShowAddLocation(false);
+    setAddFields({ name:"", address:"", city:"", state:"GA", zip:"", category:"", lat:"", lng:"" });
+    showToast(`${newLoc.name} added${newLoc.lat ? " with coordinates ✓" : " — geocode it to show on map"}`);
+  };
 
   const saveEditedLoc = () => {
     if (!editingLoc) return;
@@ -1803,7 +1978,13 @@ Respond ONLY in JSON:
           {dataSubTab === "notfound" && (
             <div className="p-5">
               <div className="max-w-3xl mx-auto">
-                {notFoundLocs.length === 0 ? (
+                <div className="flex justify-end mb-3">
+                  <button onClick={openAddLocation}
+                    className="px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded text-xs font-bold hover:bg-emerald-500/20">
+                    ➕ Add New Location
+                  </button>
+                </div>
+              {notFoundLocs.length === 0 ? (
                   <div className="text-center py-12 text-slate-500">
                     <div className="text-4xl mb-3">✅</div>
                     <div className="font-semibold text-emerald-400">All locations geocoded!</div>
@@ -1826,11 +2007,21 @@ Respond ONLY in JSON:
                       </div>
                     </div>
 
-                    <div className="flex gap-2 mb-4">
+                    <div className="flex gap-2 mb-4 flex-wrap">
                       <button onClick={() => { setDataSubTab("main"); startGeocoding(); }}
-                        className="flex-1 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-bold hover:bg-amber-500/20">
-                        🔄 Retry All with Name Search
+                        className="flex-1 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-bold hover:bg-amber-500/20 min-w-[140px]">
+                        🔄 Retry with Name Search
                       </button>
+                      <button onClick={exportNotFoundXLSX}
+                        className="flex-1 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded text-xs font-bold hover:bg-emerald-500/20 min-w-[140px]">
+                        📥 Export to Excel
+                      </button>
+                      <label className="flex-1 min-w-[140px] cursor-pointer">
+                        <div className="py-2 bg-blue-500/10 border border-blue-500/30 text-blue-400 rounded text-xs font-bold hover:bg-blue-500/20 text-center">
+                          📤 Import Geocoded Excel
+                        </div>
+                        <input type="file" accept=".xlsx,.xls" onChange={importGeocodedXLSX} className="hidden" />
+                      </label>
                     </div>
 
                     <div className="space-y-2">
@@ -1975,6 +2166,10 @@ Respond ONLY in JSON:
                       🗺️ View on Map
                     </button>
                   )}
+                  <button onClick={openAddLocation}
+                    className="w-full mt-1 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded text-sm font-semibold hover:bg-emerald-500/20 flex items-center justify-center gap-2">
+                    ➕ Add New Location
+                  </button>
                 </div>
 
                 <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
@@ -2093,6 +2288,131 @@ Respond ONLY in JSON:
                 <span>Generated by RouteIQ · rwillis9-crypto.github.io/routeiq/</span>
                 <span>Printed {new Date().toLocaleDateString()}</span>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ADD NEW LOCATION MODAL */}
+      {showAddLocation && (
+        <div className="fixed inset-0 z-[9995] bg-black/70 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-md shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+              <div>
+                <h2 className="font-bold text-sm">➕ Add New Location</h2>
+                <div className="text-xs text-slate-400 mt-0.5">Add a prospect or account not in your KML</div>
+              </div>
+              <button onClick={() => setShowAddLocation(false)} className="text-slate-400 hover:text-slate-200"><X size={18} /></button>
+            </div>
+
+            <div className="p-4 space-y-3 overflow-y-auto max-h-[70vh]">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Facility / Account Name <span className="text-red-400">*</span></label>
+                <input value={addFields.name}
+                  onChange={e => setAddFields(p => ({...p, name: e.target.value}))}
+                  placeholder="e.g. Northside Hospital Forsyth"
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-amber-500 outline-none" />
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Street Address</label>
+                <input value={addFields.address}
+                  onChange={e => setAddFields(p => ({...p, address: e.target.value}))}
+                  placeholder="e.g. 1200 Northside Forsyth Dr"
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-amber-500 outline-none" />
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">City</label>
+                  <input value={addFields.city}
+                    onChange={e => setAddFields(p => ({...p, city: e.target.value}))}
+                    placeholder="Cumming"
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">State</label>
+                  <input value={addFields.state}
+                    onChange={e => setAddFields(p => ({...p, state: e.target.value}))}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Zip</label>
+                  <input value={addFields.zip}
+                    onChange={e => setAddFields(p => ({...p, zip: e.target.value}))}
+                    placeholder="30041"
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Category</label>
+                <div className="flex gap-2">
+                  <select value={addFields.category}
+                    onChange={e => setAddFields(p => ({...p, category: e.target.value}))}
+                    className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none">
+                    {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                    <option value="__new__">+ New category…</option>
+                  </select>
+                  {addFields.category === "__new__" && (
+                    <input
+                      placeholder="Category name"
+                      onChange={e => setAddFields(p => ({...p, category: e.target.value}))}
+                      className="flex-1 bg-slate-800 border border-amber-500 rounded px-2 py-2 text-sm outline-none" />
+                  )}
+                </div>
+              </div>
+
+              {/* Geocode button */}
+              <button onClick={geocodeAddFields} disabled={addGeocoding || (!addFields.address && !addFields.name)}
+                className="w-full py-2 bg-blue-500/15 border border-blue-500/30 text-blue-400 rounded text-xs font-semibold hover:bg-blue-500/25 disabled:opacity-50 flex items-center justify-center gap-2">
+                {addGeocoding
+                  ? <><div className="w-3 h-3 border-2 border-blue-400/30 border-t-blue-400 rounded-full animate-spin" />Searching…</>
+                  : "🔍 Find Coordinates from Address / Name"}
+              </button>
+
+              {/* Manual coordinates */}
+              <div className="border-t border-slate-700 pt-3">
+                <div className="text-xs font-bold text-slate-400 mb-1">📍 Coordinates</div>
+                <div className="text-xs text-slate-500 mb-2">Auto-filled when found above, or paste from Google Maps</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Latitude</label>
+                    <input value={addFields.lat}
+                      onChange={e => setAddFields(p => ({...p, lat: e.target.value}))}
+                      placeholder="33.7490"
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm font-mono focus:border-amber-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Longitude</label>
+                    <input value={addFields.lng}
+                      onChange={e => setAddFields(p => ({...p, lng: e.target.value}))}
+                      placeholder="-84.3880"
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm font-mono focus:border-amber-500 outline-none" />
+                  </div>
+                </div>
+                {addFields.lat && addFields.lng && !isNaN(parseFloat(addFields.lat)) && (
+                  <div className="mt-2 text-xs text-emerald-400 flex items-center gap-1.5">
+                    <Check size={12} />Coordinates ready — will appear on map after saving
+                  </div>
+                )}
+                {!addFields.lat && (
+                  <div className="mt-2 text-xs text-slate-500">
+                    No coordinates yet — location will be saved but won't show on map until geocoded
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-4 py-3 border-t border-slate-800 flex gap-3">
+              <button onClick={() => setShowAddLocation(false)}
+                className="flex-1 bg-slate-800 border border-slate-700 rounded py-2.5 text-sm font-semibold text-slate-300">
+                Cancel
+              </button>
+              <button onClick={saveNewLocation} disabled={!addFields.name.trim()}
+                className="flex-1 bg-gradient-to-br from-emerald-500 to-emerald-600 text-black rounded py-2.5 text-sm font-bold disabled:opacity-40">
+                ➕ Add Location
+              </button>
             </div>
           </div>
         </div>
