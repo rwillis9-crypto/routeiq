@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import L from "leaflet";
+import * as XLSX from "xlsx";
 import {
   MapPin, Calendar, Sparkles, Save, History, Upload, Trash2,
   X, Check, Navigation, AlertCircle, Key, Settings, Pause, Play
@@ -56,8 +57,25 @@ function parseKML(xmlText) {
         const v = d.getElementsByTagName("value")[0]?.textContent?.trim();
         if (k && v) ext[k] = v;
       }
-      if (!address && ext.Street) {
-        address = [ext.Street, ext.City, ext.State, ext.Zip].filter(Boolean).join(", ");
+
+      // Prefer ExtendedData fields for clean street/city/state/zip
+      // If not present, try to split the combined address string
+      let street = ext.Street || "";
+      let city   = ext.City   || "";
+      let state  = ext.State  || "";
+      let zip    = ext.Zip    || "";
+
+      if (address && !street) {
+        // Combined address — split it into parts
+        const split = splitAddress(address);
+        street = split.street;
+        city   = split.city;
+        state  = split.state || "GA";
+        zip    = split.zip;
+      }
+
+      if (!address) {
+        address = [street, city, state, zip].filter(Boolean).join(", ");
       }
 
       let lat = null, lng = null;
@@ -70,7 +88,7 @@ function parseKML(xmlText) {
           if (!isNaN(la) && !isNaN(lo) && (la !== 0 || lo !== 0)) { lat = la; lng = lo; }
         }
       }
-      result.push({ id: "loc_" + result.length, name, address, category: folderName, lat, lng });
+      result.push({ id: "loc_" + result.length, name, address, street, city, state, zip, category: folderName, lat, lng });
     }
   };
 
@@ -83,6 +101,42 @@ function parseKML(xmlText) {
     grabPlacemarks(doc, "All Locations");
   }
   return result;
+}
+
+// ─── Address splitter — parses "123 Main St Tucker GA 30084" into parts ──────
+function splitAddress(fullAddr) {
+  if (!fullAddr) return { street: "", city: "", state: "", zip: "" };
+
+  // Try to extract zip (5 digits at end)
+  const zipMatch = fullAddr.match(/(\d{5})(-\d{4})?\s*$/);
+  const zip = zipMatch ? zipMatch[1] : "";
+  let rest = zip ? fullAddr.slice(0, zipMatch.index).trim() : fullAddr.trim();
+
+  // Try to extract state (2-letter abbreviation before zip)
+  const stateMatch = rest.match(/([A-Z]{2})\s*$/);
+  const state = stateMatch ? stateMatch[1] : "";
+  if (stateMatch) rest = rest.slice(0, stateMatch.index).trim().replace(/,\s*$/, "");
+
+  // Split remaining into street and city at last comma or known city boundary
+  const commaIdx = rest.lastIndexOf(",");
+  let street = "", city = "";
+  if (commaIdx > 0) {
+    street = rest.slice(0, commaIdx).trim();
+    city   = rest.slice(commaIdx + 1).trim();
+  } else {
+    // No comma — try to split at the last word before state (heuristic)
+    const parts = rest.split(/\s+/);
+    // Assume last 1-2 words are city, rest is street
+    if (parts.length > 3) {
+      city   = parts.slice(-2).join(" ");
+      street = parts.slice(0, -2).join(" ");
+    } else {
+      street = rest;
+      city   = "";
+    }
+  }
+
+  return { street: street.trim(), city: city.trim(), state: state.trim(), zip: zip.trim() };
 }
 
 // ─── Geocoding (Nominatim) ───────────────────────────────────────────────────
@@ -431,7 +485,10 @@ export default function App() {
   const [syncLoading, setSyncLoading] = useState(false);
 
   // Manual location editor
-  const [editingLoc, setEditingLoc] = useState(null);   // location being edited
+  const [editingLoc, setEditingLoc] = useState(null);
+  const [showAddLocation, setShowAddLocation] = useState(false);
+  const [addFields, setAddFields] = useState({ name:"", address:"", city:"", state:"GA", zip:"", category:"", lat:"", lng:"" });
+  const [addGeocoding, setAddGeocoding] = useState(false);   // location being edited
   const [editFields, setEditFields] = useState({});      // { name, address, city, state, zip, lat, lng }
   const [editGeocoding, setEditGeocoding] = useState(false);
   const [dataSubTab, setDataSubTab] = useState("main"); // "main" | "notfound"
@@ -949,8 +1006,7 @@ Respond ONLY in JSON:
     setReoptLoading(true);
     if (apiKey) {
       try {
-        const locList = remaining.map(s => `- ID:${s.id} | ${s.name} | ${s.address}`).join("
-");
+        const locList = remaining.map(s => `- ID:${s.id} | ${s.name} | ${s.address}`).join("\n");
         const prompt = `You are a sales route optimizer. A driver has skipped a stop and needs a reoptimized route for the remaining stops.
 Current location: approximate position on the route.
 Remaining stops to visit:
@@ -1011,8 +1067,7 @@ Respond ONLY in JSON:
       s.driveMin      || "",
       `"${(s.note || "").replace(/"/g, '""')}"`,
     ]);
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("
-");
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
@@ -1023,12 +1078,169 @@ Respond ONLY in JSON:
     showToast("CSV exported ✓");
   };
 
+  // ─── Excel export of not-found locations ──
+  const exportNotFoundXLSX = () => {
+    const rows = notFoundLocs.map((l, i) => ({
+      "Row #":      i + 1,
+      "ID":         l.id,
+      "Name":       l.name       || "",
+      "Street":     l.street     || l.address || "",
+      "City":       l.city       || "",
+      "State":      l.state      || "",
+      "Zip":        l.zip        || "",
+      "Full Address": l.address  || "",
+      "Category":   l.category   || "",
+      "Latitude":   "",   // ← fill these in your external script
+      "Longitude":  "",
+      "Notes":      "",
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+
+    // Column widths
+    ws["!cols"] = [
+      { wch: 6 }, { wch: 20 }, { wch: 35 }, { wch: 30 },
+      { wch: 18 }, { wch: 8 }, { wch: 10 }, { wch: 40 },
+      { wch: 22 }, { wch: 12 }, { wch: 12 }, { wch: 20 },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Not Found Locations");
+
+    // Add instructions sheet
+    const instructions = [
+      ["INSTRUCTIONS — RouteIQ Location Geocoding"],
+      [""],
+      ["1. The 'Latitude' and 'Longitude' columns are empty — fill them in using your geocoding script or manually from Google Maps"],
+      ["2. Do NOT change the 'ID' column — RouteIQ uses it to match rows back to your locations"],
+      ["3. Do NOT add or remove rows"],
+      ["4. Latitude example:  33.7490"],
+      ["5. Longitude example: -84.3880  (negative for USA)"],
+      ["6. Save the file as .xlsx and upload it back into RouteIQ using the 'Import Geocoded Excel' button"],
+      [""],
+      ["How to get coordinates from Google Maps:"],
+      ["  - Search for the facility name"],
+      ["  - Right-click the pin on the map"],
+      ["  - The coordinates appear at the top of the right-click menu"],
+      ["  - Click them to copy (format: 33.7490, -84.3880)"],
+    ];
+    const ws2 = XLSX.utils.aoa_to_sheet(instructions);
+    ws2["!cols"] = [{ wch: 80 }];
+    XLSX.utils.book_append_sheet(wb, ws2, "Instructions");
+
+    XLSX.writeFile(wb, `RouteIQ-NotFound-${todayStr()}.xlsx`);
+    showToast(`Exported ${rows.length} locations to Excel ✓`);
+  };
+
+  // ─── Import geocoded Excel back in ──
+  const importGeocodedXLSX = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const buffer = await file.arrayBuffer();
+      const wb     = XLSX.read(buffer, { type: "array" });
+
+      // Read first sheet
+      const ws   = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws);
+
+      if (rows.length === 0) { showToast("No data found in Excel file", "err"); return; }
+
+      // Validate it has the right columns
+      const first = rows[0];
+      if (!("ID" in first) || !("Latitude" in first) || !("Longitude" in first)) {
+        showToast("Excel file must have ID, Latitude, and Longitude columns", "err");
+        return;
+      }
+
+      // Build a map of id → coords from the Excel rows
+      const coordMap = {};
+      let filled = 0;
+      for (const row of rows) {
+        const id  = String(row["ID"] || "").trim();
+        const lat = parseFloat(row["Latitude"]  || row["latitude"]  || "");
+        const lng = parseFloat(row["Longitude"] || row["longitude"] || "");
+        if (id && !isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
+          coordMap[id] = { lat, lng };
+          filled++;
+        }
+      }
+
+      if (filled === 0) {
+        showToast("No coordinates found in the Excel file — make sure Latitude and Longitude columns are filled in", "warn");
+        return;
+      }
+
+      // Apply to locations
+      const updated = locs.map(l => {
+        if (coordMap[l.id]) {
+          return { ...l, lat: coordMap[l.id].lat, lng: coordMap[l.id].lng, geocodeMethod: "excel-import" };
+        }
+        return l;
+      });
+
+      setLocs(updated);
+      persistLocs(updated);
+      showToast(`Imported ${filled} coordinates from Excel ✓`);
+
+      // Refresh map markers
+      if (leafletMap.current) {
+        Object.values(markers.current).forEach(m => leafletMap.current.removeLayer(m));
+        markers.current = {};
+        updated.filter(l => l.lat && l.lng).forEach(loc => placeMarker(window.L, leafletMap.current, loc));
+      }
+    } catch (err) {
+      showToast("Error reading Excel file: " + err.message, "err");
+    }
+    // Reset input so same file can be re-imported
+    e.target.value = "";
+  };
+
   const deleteTrip = (id, e) => {
     e.stopPropagation();
     const u = history.filter((t) => t.id !== id);
     setHistory(u);
     persistHistory(u);
     if (selTrip?.id === id) setSelTrip(null);
+  };
+
+  // ─── Fix all combined addresses in bulk ──
+  const fixAllAddresses = () => {
+    let fixedCount = 0;
+    const updated = locs.map(loc => {
+      // Only process locations where city is missing but address looks combined
+      if (loc.city && loc.city.trim()) return loc; // already has city, skip
+      if (!loc.address && !loc.street) return loc;  // nothing to work with
+
+      // Use street field if it looks combined, otherwise use full address
+      const combined = (!loc.city && loc.street && /[A-Z]{2}\s*\d{5}/.test(loc.street))
+        ? loc.street
+        : loc.address;
+
+      if (!combined) return loc;
+
+      const split = splitAddress(combined);
+      if (!split.city && !split.zip) return loc; // couldn't split meaningfully
+
+      fixedCount++;
+      const street = split.street || loc.street || "";
+      const city   = split.city   || loc.city   || "";
+      const state  = split.state  || loc.state  || "GA";
+      const zip    = split.zip    || loc.zip    || "";
+      return {
+        ...loc,
+        street,
+        city,
+        state,
+        zip,
+        // Rebuild clean full address
+        address: [street, city, state, zip].filter(Boolean).join(", "),
+      };
+    });
+
+    setLocs(updated);
+    persistLocs(updated);
+    showToast(`Fixed ${fixedCount} addresses ✓`);
   };
 
   const clearAllData = () => {
@@ -1043,30 +1255,102 @@ Respond ONLY in JSON:
   // ─── Manual location editor ──
   const openEditor = (loc) => {
     setEditingLoc(loc);
+
+    // If city is empty but address looks combined, auto-split it
+    let street = loc.street || "";
+    let city   = loc.city   || "";
+    let state  = loc.state  || "";
+    let zip    = loc.zip    || "";
+
+    if (!city && loc.address) {
+      const split = splitAddress(loc.address);
+      street = street || split.street;
+      city   = split.city;
+      state  = state  || split.state || "GA";
+      zip    = zip    || split.zip;
+    }
+
     setEditFields({
-      name:    loc.name    || "",
-      address: loc.address || "",
-      city:    loc.city    || "",
-      state:   loc.state   || "GA",
-      zip:     loc.zip     || "",
-      lat:     loc.lat     ? String(loc.lat) : "",
-      lng:     loc.lng     ? String(loc.lng) : "",
+      name:    loc.name || "",
+      address: street   || loc.address || "",
+      city:    city,
+      state:   state    || "GA",
+      zip:     zip,
+      lat:     loc.lat  ? String(loc.lat)  : "",
+      lng:     loc.lng  ? String(loc.lng)  : "",
     });
   };
 
   const closeEditor = () => { setEditingLoc(null); setEditFields({}); setEditGeocoding(false); };
 
+  const openAddLocation = () => {
+    setAddFields({ name:"", address:"", city:"", state:"GA", zip:"", category: categories[0] || "", lat:"", lng:"" });
+    setShowAddLocation(true);
+  };
+
+  const geocodeAddFields = async () => {
+    setAddGeocoding(true);
+    const fullAddr = [addFields.address, addFields.city, addFields.state, addFields.zip].filter(Boolean).join(", ");
+    const result = await geocodeAddress(fullAddr, addFields.name, addFields.city, addFields.state || "GA", addFields.zip);
+    if (result) {
+      setAddFields(prev => ({ ...prev, lat: String(result.lat), lng: String(result.lng) }));
+      showToast(`Found via ${result.method} ✓`);
+    } else {
+      showToast("Address not found — try editing or enter coordinates manually", "warn");
+    }
+    setAddGeocoding(false);
+  };
+
+  const saveNewLocation = () => {
+    if (!addFields.name.trim()) { showToast("Name is required", "err"); return; }
+
+    const lat = parseFloat(addFields.lat);
+    const lng = parseFloat(addFields.lng);
+    const newLoc = {
+      id:       "manual_" + Date.now(),
+      name:     addFields.name.trim(),
+      address:  [addFields.address, addFields.city, addFields.state, addFields.zip].filter(Boolean).join(", "),
+      street:   addFields.address,
+      city:     addFields.city,
+      state:    addFields.state || "GA",
+      zip:      addFields.zip,
+      category: addFields.category || "Manual Entry",
+      lat:      !isNaN(lat) && lat ? lat : null,
+      lng:      !isNaN(lng) && lng ? lng : null,
+      geocodeMethod: "manual",
+    };
+
+    const updated = [...locs, newLoc];
+
+    // If category is new, assign a color
+    if (!categoryColors[newLoc.category]) {
+      const newColors = { ...categoryColors };
+      newColors[newLoc.category] = CATEGORY_COLORS[Object.keys(newColors).length % CATEGORY_COLORS.length];
+      setCategoryColors(newColors);
+    }
+
+    setLocs(updated);
+    persistLocs(updated);
+    setShowAddLocation(false);
+    setAddFields({ name:"", address:"", city:"", state:"GA", zip:"", category:"", lat:"", lng:"" });
+    showToast(`${newLoc.name} added${newLoc.lat ? " with coordinates ✓" : " — geocode it to show on map"}`);
+  };
+
   const saveEditedLoc = () => {
     if (!editingLoc) return;
     const lat = parseFloat(editFields.lat);
     const lng = parseFloat(editFields.lng);
+    const street = editFields.address.trim();
+    const city   = editFields.city.trim();
+    const state  = editFields.state.trim() || "GA";
+    const zip    = editFields.zip.trim();
+    // Rebuild clean full address from split fields
+    const fullAddress = [street, city, state, zip].filter(Boolean).join(", ");
     const updated = locs.map(l => l.id === editingLoc.id ? {
       ...l,
-      name:    editFields.name.trim()    || l.name,
-      address: editFields.address.trim() || l.address,
-      city:    editFields.city.trim()    || l.city,
-      state:   editFields.state.trim()   || l.state,
-      zip:     editFields.zip.trim()     || l.zip,
+      name:    editFields.name.trim() || l.name,
+      address: fullAddress || l.address,
+      street, city, state, zip,
       lat:     !isNaN(lat) && lat ? lat : l.lat,
       lng:     !isNaN(lng) && lng ? lng : l.lng,
     } : l);
@@ -1131,7 +1415,7 @@ Respond ONLY in JSON:
   const categories      = [...new Set(locs.map((l) => l.category))];
   const geocodedCount   = locs.filter((l) => l.lat && l.lng).length;
   const ungeocodedCount = locs.filter((l) => !l.lat).length;
-  const notFoundLocs    = locs.filter((l) => !l.lat && !l.lng);
+  const notFoundLocs    = locs.filter((l) => !l.lat && (l.address || l.name));
 
   const TABS = [
     { id: "map", label: "Map", icon: MapPin },
@@ -1805,7 +2089,13 @@ Respond ONLY in JSON:
           {dataSubTab === "notfound" && (
             <div className="p-5">
               <div className="max-w-3xl mx-auto">
-                {notFoundLocs.length === 0 ? (
+                <div className="flex justify-end mb-3">
+                  <button onClick={openAddLocation}
+                    className="px-3 py-1.5 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded text-xs font-bold hover:bg-emerald-500/20">
+                    ➕ Add New Location
+                  </button>
+                </div>
+              {notFoundLocs.length === 0 ? (
                   <div className="text-center py-12 text-slate-500">
                     <div className="text-4xl mb-3">✅</div>
                     <div className="font-semibold text-emerald-400">All locations geocoded!</div>
@@ -1828,11 +2118,34 @@ Respond ONLY in JSON:
                       </div>
                     </div>
 
-                    <div className="flex gap-2 mb-4">
-                      <button onClick={() => startGeocoding()}
-                        className="flex-1 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-bold hover:bg-amber-500/20">
-                        🔄 Retry All with Name Search
+                    {/* Fix addresses first banner */}
+                    {locs.filter(l => !l.city && l.address).length > 0 && (
+                      <div className="mb-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg flex items-center justify-between gap-3">
+                        <div className="text-xs text-blue-300 leading-relaxed">
+                          <strong className="text-blue-200">{locs.filter(l => !l.city && l.address).length} locations</strong> have combined addresses that can be auto-split into Street / City / State / Zip — do this first before retrying geocoding.
+                        </div>
+                        <button onClick={fixAllAddresses}
+                          className="flex-shrink-0 px-3 py-2 bg-blue-500 text-white rounded text-xs font-bold hover:bg-blue-600 whitespace-nowrap">
+                          🔧 Fix All Now
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="flex gap-2 mb-4 flex-wrap">
+                      <button onClick={() => { setDataSubTab("main"); startGeocoding(); }}
+                        className="flex-1 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-bold hover:bg-amber-500/20 min-w-[140px]">
+                        🔄 Retry with Name Search
                       </button>
+                      <button onClick={exportNotFoundXLSX}
+                        className="flex-1 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded text-xs font-bold hover:bg-emerald-500/20 min-w-[140px]">
+                        📥 Export to Excel
+                      </button>
+                      <label className="flex-1 min-w-[140px] cursor-pointer">
+                        <div className="py-2 bg-blue-500/10 border border-blue-500/30 text-blue-400 rounded text-xs font-bold hover:bg-blue-500/20 text-center">
+                          📤 Import Geocoded Excel
+                        </div>
+                        <input type="file" accept=".xlsx,.xls" onChange={importGeocodedXLSX} className="hidden" />
+                      </label>
                     </div>
 
                     <div className="space-y-2">
@@ -1929,9 +2242,17 @@ Respond ONLY in JSON:
                   </div>
 
                   {ungeocodedCount > 0 && !geoProgress.active && (
-                    <button onClick={() => startGeocoding()} className="w-full mt-3.5 bg-gradient-to-br from-amber-500 to-orange-600 text-black rounded py-2.5 font-bold text-sm">
-                      📍 Geocode {ungeocodedCount} Locations (~{Math.ceil(ungeocodedCount / 45)} min)
-                    </button>
+                    <>
+                      {locs.filter(l => !l.city && l.address).length > 0 && (
+                        <button onClick={fixAllAddresses}
+                          className="w-full mt-3.5 py-2.5 bg-blue-500/15 border border-blue-500/30 text-blue-400 rounded font-bold text-sm hover:bg-blue-500/25">
+                          🔧 Fix All Combined Addresses First ({locs.filter(l => !l.city && l.address).length})
+                        </button>
+                      )}
+                      <button onClick={() => startGeocoding()} className="w-full mt-2 bg-gradient-to-br from-amber-500 to-orange-600 text-black rounded py-2.5 font-bold text-sm">
+                        📍 Geocode {ungeocodedCount} Locations (~{Math.ceil(ungeocodedCount / 45)} min)
+                      </button>
+                    </>
                   )}
 
                   {geoProgress.active && (
@@ -1966,7 +2287,7 @@ Respond ONLY in JSON:
                       <div className="text-xs text-slate-400 mb-2 leading-relaxed">
                         These may have unusual addresses. The app already tried searching by facility name as a fallback. You can manually search for them on Google Maps and note their coordinates, or they simply won't appear as map pins (but are still available in the Plan tab lists).
                       </div>
-                      <button onClick={() => startGeocoding()} className="w-full px-2 py-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-semibold hover:bg-amber-500/20">
+                      <button onClick={() => startGeocoding()} className="w-full px-2 py-1.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 rounded text-xs font-semibold hover:bg-amber-500/20 active:bg-amber-500/30">
                         🔄 Retry Not-Found Locations
                       </button>
                     </div>
@@ -1977,6 +2298,10 @@ Respond ONLY in JSON:
                       🗺️ View on Map
                     </button>
                   )}
+                  <button onClick={openAddLocation}
+                    className="w-full mt-1 py-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 rounded text-sm font-semibold hover:bg-emerald-500/20 flex items-center justify-center gap-2">
+                    ➕ Add New Location
+                  </button>
                 </div>
 
                 <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
@@ -2095,6 +2420,131 @@ Respond ONLY in JSON:
                 <span>Generated by RouteIQ · rwillis9-crypto.github.io/routeiq/</span>
                 <span>Printed {new Date().toLocaleDateString()}</span>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ADD NEW LOCATION MODAL */}
+      {showAddLocation && (
+        <div className="fixed inset-0 z-[9995] bg-black/70 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-md shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
+              <div>
+                <h2 className="font-bold text-sm">➕ Add New Location</h2>
+                <div className="text-xs text-slate-400 mt-0.5">Add a prospect or account not in your KML</div>
+              </div>
+              <button onClick={() => setShowAddLocation(false)} className="text-slate-400 hover:text-slate-200"><X size={18} /></button>
+            </div>
+
+            <div className="p-4 space-y-3 overflow-y-auto max-h-[70vh]">
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Facility / Account Name <span className="text-red-400">*</span></label>
+                <input value={addFields.name}
+                  onChange={e => setAddFields(p => ({...p, name: e.target.value}))}
+                  placeholder="e.g. Northside Hospital Forsyth"
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-amber-500 outline-none" />
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Street Address</label>
+                <input value={addFields.address}
+                  onChange={e => setAddFields(p => ({...p, address: e.target.value}))}
+                  placeholder="e.g. 1200 Northside Forsyth Dr"
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-sm focus:border-amber-500 outline-none" />
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">City</label>
+                  <input value={addFields.city}
+                    onChange={e => setAddFields(p => ({...p, city: e.target.value}))}
+                    placeholder="Cumming"
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">State</label>
+                  <input value={addFields.state}
+                    onChange={e => setAddFields(p => ({...p, state: e.target.value}))}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">Zip</label>
+                  <input value={addFields.zip}
+                    onChange={e => setAddFields(p => ({...p, zip: e.target.value}))}
+                    placeholder="30041"
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none" />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Category</label>
+                <div className="flex gap-2">
+                  <select value={addFields.category}
+                    onChange={e => setAddFields(p => ({...p, category: e.target.value}))}
+                    className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm focus:border-amber-500 outline-none">
+                    {categories.map(c => <option key={c} value={c}>{c}</option>)}
+                    <option value="__new__">+ New category…</option>
+                  </select>
+                  {addFields.category === "__new__" && (
+                    <input
+                      placeholder="Category name"
+                      onChange={e => setAddFields(p => ({...p, category: e.target.value}))}
+                      className="flex-1 bg-slate-800 border border-amber-500 rounded px-2 py-2 text-sm outline-none" />
+                  )}
+                </div>
+              </div>
+
+              {/* Geocode button */}
+              <button onClick={geocodeAddFields} disabled={addGeocoding || (!addFields.address && !addFields.name)}
+                className="w-full py-2 bg-blue-500/15 border border-blue-500/30 text-blue-400 rounded text-xs font-semibold hover:bg-blue-500/25 disabled:opacity-50 flex items-center justify-center gap-2">
+                {addGeocoding
+                  ? <><div className="w-3 h-3 border-2 border-blue-400/30 border-t-blue-400 rounded-full animate-spin" />Searching…</>
+                  : "🔍 Find Coordinates from Address / Name"}
+              </button>
+
+              {/* Manual coordinates */}
+              <div className="border-t border-slate-700 pt-3">
+                <div className="text-xs font-bold text-slate-400 mb-1">📍 Coordinates</div>
+                <div className="text-xs text-slate-500 mb-2">Auto-filled when found above, or paste from Google Maps</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Latitude</label>
+                    <input value={addFields.lat}
+                      onChange={e => setAddFields(p => ({...p, lat: e.target.value}))}
+                      placeholder="33.7490"
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm font-mono focus:border-amber-500 outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Longitude</label>
+                    <input value={addFields.lng}
+                      onChange={e => setAddFields(p => ({...p, lng: e.target.value}))}
+                      placeholder="-84.3880"
+                      className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-2 text-sm font-mono focus:border-amber-500 outline-none" />
+                  </div>
+                </div>
+                {addFields.lat && addFields.lng && !isNaN(parseFloat(addFields.lat)) && (
+                  <div className="mt-2 text-xs text-emerald-400 flex items-center gap-1.5">
+                    <Check size={12} />Coordinates ready — will appear on map after saving
+                  </div>
+                )}
+                {!addFields.lat && (
+                  <div className="mt-2 text-xs text-slate-500">
+                    No coordinates yet — location will be saved but won't show on map until geocoded
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-4 py-3 border-t border-slate-800 flex gap-3">
+              <button onClick={() => setShowAddLocation(false)}
+                className="flex-1 bg-slate-800 border border-slate-700 rounded py-2.5 text-sm font-semibold text-slate-300">
+                Cancel
+              </button>
+              <button onClick={saveNewLocation} disabled={!addFields.name.trim()}
+                className="flex-1 bg-gradient-to-br from-emerald-500 to-emerald-600 text-black rounded py-2.5 text-sm font-bold disabled:opacity-40">
+                ➕ Add Location
+              </button>
             </div>
           </div>
         </div>
